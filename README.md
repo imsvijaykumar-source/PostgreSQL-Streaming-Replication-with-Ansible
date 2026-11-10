@@ -443,6 +443,5 @@ MIT. Add a `LICENSE` file before publishing.
 
 ## Author
 
-**Vijay**, Oracle and PostgreSQL DBA. Connect on LinkedIn: _add your profile link here_.
-# PostgreSQL-Streaming-Replication-with-Ansible
-PostgreSQL Streaming Replication with Ansible
+**Vijay**, Oracle and PostgreSQL DBA
+
