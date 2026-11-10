@@ -1,0 +1,413 @@
+---
+##############################################################
+# STAGE 0: PRE-VALIDATION
+##############################################################
+- name: "STAGE 0A - Pre-validation (all nodes)"
+  hosts: pg
+  become: yes
+  tasks:
+    - name: Free disk on / (MB)
+      shell: df -BM --output=avail / | tail -1 | tr -dc 0-9
+      register: disk
+      changed_when: false
+
+    - name: Check hostname resolution of peers
+      shell: getent hosts pg-primary && getent hosts pg-standby
+      register: dns
+      changed_when: false
+
+    - name: Assert node basics
+      assert:
+        that:
+          - disk.stdout | int > 2000
+          - dns.rc == 0
+        fail_msg: "PRE-CHECK FAILED on {{ inventory_hostname }}: disk < 2GB ya /etc/hosts entries missing"
+        success_msg: "✔ PRE-CHECK OK on {{ inventory_hostname }}: disk={{ disk.stdout }}MB, hostnames resolve"
+
+- name: "STAGE 0B - Pre-validation (primary)"
+  hosts: primary
+  become: yes
+  tasks:
+    - name: PostgreSQL service state
+      shell: systemctl is-active postgresql-15
+      register: svc
+      changed_when: false
+      failed_when: false
+
+    - name: Primary is not in recovery
+      become_user: postgres
+      shell: psql -tAc "select pg_is_in_recovery()"
+      args: { chdir: /tmp }
+      register: inrec
+      changed_when: false
+      failed_when: false
+
+    - name: Server major version
+      become_user: postgres
+      shell: psql -tAc "show server_version_num"
+      args: { chdir: /tmp }
+      register: ver
+      changed_when: false
+      failed_when: false
+
+    - name: pg_hba.conf exists
+      stat: { path: "{{ pgdata }}/pg_hba.conf" }
+      register: hbaf
+
+    - name: Assert primary is healthy
+      assert:
+        that:
+          - svc.stdout | trim == 'active'
+          - inrec.stdout | trim == 'f'
+          - (ver.stdout | trim).startswith('15')
+          - hbaf.stat.exists
+        fail_msg: "PRE-CHECK FAILED (primary): service={{ svc.stdout }}, in_recovery={{ inrec.stdout }}, version={{ ver.stdout }}, pg_hba={{ hbaf.stat.exists }}"
+        success_msg: "✔ PRE-CHECK OK (primary): PG15 running, not in recovery, pg_hba found"
+
+- name: "STAGE 0C - Pre-validation (standby)"
+  hosts: standby
+  become: yes
+  tasks:
+    - name: Primary SSH port reachable from standby
+      wait_for: { host: "{{ primary_ip }}", port: 22, timeout: 10 }
+
+    - name: Existing PG_VERSION in standby data dir?
+      stat: { path: "{{ pgdata }}/PG_VERSION" }
+      register: pgv
+
+    - name: Existing standby.signal?
+      stat: { path: "{{ pgdata }}/standby.signal" }
+      register: ssig
+
+    - name: Safety guard - data dir wipe se pehle
+      assert:
+        that:
+          - (not pgv.stat.exists) or ssig.stat.exists or (force_rebuild | default(false) | bool)
+        fail_msg: "ABORT: standby par data dir mein non-standby cluster hai. Wipe karna ho to chalao: ansible-playbook site.yml -e force_rebuild=true"
+        success_msg: "✔ PRE-CHECK OK (standby): data dir wipe safe hai"
+
+##############################################################
+# STAGE 1: PRIMARY PREPARATION + POST-VALIDATION
+##############################################################
+- name: "STAGE 1 - Prepare primary for streaming replication"
+  hosts: primary
+  become: yes
+  tasks:
+    - name: Check current listen_addresses
+      become_user: postgres
+      shell: psql -tAc "show listen_addresses"
+      args: { chdir: /tmp }
+      register: la
+      changed_when: false
+
+    - name: Create replication role
+      become_user: postgres
+      shell: |
+        psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ repl_user }}'" | grep -q 1 ||
+        psql -c "CREATE ROLE {{ repl_user }} WITH REPLICATION LOGIN PASSWORD '{{ repl_pass }}'"
+      args: { chdir: /tmp, executable: /bin/bash }
+      register: role
+      changed_when: "'CREATE ROLE' in role.stdout"
+
+    - name: Create physical replication slot
+      become_user: postgres
+      shell: |
+        psql -tAc "SELECT 1 FROM pg_replication_slots WHERE slot_name='{{ slot }}'" | grep -q 1 ||
+        psql -tAc "SELECT pg_create_physical_replication_slot('{{ slot }}')"
+      args: { chdir: /tmp, executable: /bin/bash }
+      register: sl
+      changed_when: "'(' in sl.stdout"
+
+    - name: Set replication parameters
+      become_user: postgres
+      shell: psql -c "ALTER SYSTEM SET {{ item.k }} = '{{ item.v }}'"
+      args: { chdir: /tmp }
+      loop:
+        - { k: listen_addresses, v: '*' }
+        - { k: max_wal_senders, v: '10' }
+        - { k: max_replication_slots, v: '10' }
+        - { k: hot_standby, v: 'on' }
+        - { k: wal_keep_size, v: '256MB' }
+      changed_when: false
+
+    - name: Allow standby in pg_hba.conf
+      lineinfile:
+        path: "{{ pgdata }}/pg_hba.conf"
+        line: "host replication {{ repl_user }} {{ lab_net }} md5"
+      register: hba
+
+    - name: Restart PostgreSQL if needed
+      service: { name: postgresql-15, state: restarted }
+      when: (la.stdout | trim) != '*' or hba.changed
+
+    - name: Open 5432 if firewalld is active
+      shell: firewall-cmd --permanent --add-port=5432/tcp && firewall-cmd --reload
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Post-check - role replication attribute
+      become_user: postgres
+      shell: psql -tAc "select rolreplication from pg_roles where rolname='{{ repl_user }}'"
+      args: { chdir: /tmp }
+      register: v_role
+      changed_when: false
+
+    - name: Post-check - slot exists
+      become_user: postgres
+      shell: psql -tAc "select count(*) from pg_replication_slots where slot_name='{{ slot }}'"
+      args: { chdir: /tmp }
+      register: v_slot
+      changed_when: false
+
+    - name: Post-check - live parameters
+      become_user: postgres
+      shell: psql -tAc "select current_setting('listen_addresses')||'|'||current_setting('max_wal_senders')||'|'||current_setting('wal_level')"
+      args: { chdir: /tmp }
+      register: v_par
+      changed_when: false
+
+    - name: Post-check - pg_hba entry present
+      shell: grep -c "replication {{ repl_user }} {{ lab_net }}" {{ pgdata }}/pg_hba.conf
+      register: v_hba
+      changed_when: false
+
+    - name: Assert STAGE 1
+      assert:
+        that:
+          - v_role.stdout | trim == 't'
+          - v_slot.stdout | trim == '1'
+          - (v_par.stdout | trim).split('|')[0] == '*'
+          - (v_par.stdout | trim).split('|')[2] in ['replica', 'logical']
+          - v_hba.stdout | trim | int >= 1
+        fail_msg: "STAGE 1 FAILED: role={{ v_role.stdout }}, slot_count={{ v_slot.stdout }}, params(listen|senders|wal_level)={{ v_par.stdout }}, hba_lines={{ v_hba.stdout }}"
+        success_msg: "✔ STAGE 1 COMPLETE: replication role, slot, parameters aur pg_hba sab verified"
+
+##############################################################
+# STAGE 2: VERIFY/INSTALL PG15, THEN BUILD STANDBY
+##############################################################
+- name: "STAGE 2 - Verify PG15 install, then build standby"
+  hosts: standby
+  become: yes
+  tasks:
+    - name: Primary PostgreSQL port 5432 reachable from standby
+      wait_for: { host: "{{ primary_ip }}", port: 5432, timeout: 20 }
+
+    # ---------- 2A: VERIFY INSTALLATION ----------
+    - name: Check if PG15 binaries are installed
+      stat: { path: /usr/pgsql-15/bin/pg_basebackup }
+      register: pg_bin
+
+    - name: Install status
+      debug:
+        msg: "{{ '✔ PG15 already installed on standby, install skip hoga' if pg_bin.stat.exists else 'PG15 NOT installed, installation shuru hoga' }}"
+
+    # ---------- 2B: INSTALL (only if missing) ----------
+    - name: Install PG15 (only if missing)
+      when: not pg_bin.stat.exists
+      block:
+        - name: Install EPEL
+          yum: { name: epel-release, state: present }
+
+        - name: Point EPEL to archive mirror
+          shell: |
+            sed -i -e 's/^metalink=/#metalink=/' \
+                   -e 's|^#baseurl=http://download.fedoraproject.org/pub/epel|baseurl=https://archives.fedoraproject.org/pub/archive/epel|' \
+                   /etc/yum.repos.d/epel*.repo
+            yum clean all
+          args: { executable: /bin/bash, warn: false }
+          changed_when: false
+
+        - name: Install libzstd (PG15 dependency)
+          yum: { name: libzstd, state: present }
+
+        - name: Install PGDG repo RPM
+          yum:
+            name: https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+            state: present
+            disable_gpg_check: yes
+
+        - name: Enable only pgdg15 and pgdg-common
+          shell: |
+            sed -i 's/^enabled=1/enabled=0/' /etc/yum.repos.d/pgdg-redhat-all.repo
+            for r in pgdg15 pgdg-common; do
+              sed -i "/^\[$r\]/,/^\[/ s/^enabled=0/enabled=1/" /etc/yum.repos.d/pgdg-redhat-all.repo
+            done
+            yum clean all
+          args: { executable: /bin/bash, warn: false }
+
+        - name: Install PostgreSQL 15 packages
+          yum:
+            name: [postgresql15-server, postgresql15-contrib]
+            state: present
+            disable_gpg_check: yes
+
+    # ---------- 2C: POST-VALIDATE INSTALLATION ----------
+    - name: Post-check - PG15 version
+      command: /usr/pgsql-15/bin/postgres --version
+      register: v_ver
+      changed_when: false
+      failed_when: false
+
+    - name: Post-check - pg_basebackup version
+      command: /usr/pgsql-15/bin/pg_basebackup --version
+      register: v_bb
+      changed_when: false
+      failed_when: false
+
+    - name: Assert INSTALL
+      assert:
+        that:
+          - "'15' in v_ver.stdout"
+          - "'15' in v_bb.stdout"
+        fail_msg: "INSTALL FAILED on {{ inventory_hostname }}: postgres='{{ v_ver.stdout }}{{ v_ver.msg | default('') }}', pg_basebackup='{{ v_bb.stdout }}{{ v_bb.msg | default('') }}'"
+        success_msg: "✔ INSTALL VERIFIED on {{ inventory_hostname }}: {{ v_ver.stdout }}"
+
+    # ---------- 2D: BUILD STANDBY ----------
+    - name: Check if already a standby
+      stat: { path: "{{ pgdata }}/standby.signal" }
+      register: sb
+
+    - name: Take base backup (only if not already standby)
+      when: not sb.stat.exists
+      block:
+        - name: Stop service
+          service: { name: postgresql-15, state: stopped }
+        - name: Empty data dir
+          file: { path: "{{ pgdata }}", state: absent }
+        - name: Recreate data dir
+          file: { path: "{{ pgdata }}", state: directory, owner: postgres, group: postgres, mode: '0700' }
+        - name: pg_basebackup with -R
+          become_user: postgres
+          command: >
+            /usr/pgsql-15/bin/pg_basebackup -D {{ pgdata }} -Fp -Xs -R -S {{ slot }} --checkpoint=fast
+            -d "host={{ primary_ip }} port=5432 user={{ repl_user }} password={{ repl_pass }} application_name=pg-standby"
+          args: { chdir: /tmp }
+
+    - name: Start and enable standby
+      service: { name: postgresql-15, state: started, enabled: yes }
+
+    # ---------- 2E: POST-VALIDATE STANDBY ----------
+    - name: Post-check - standby.signal file
+      stat: { path: "{{ pgdata }}/standby.signal" }
+      register: v_sig
+
+    - name: Post-check - service active
+      shell: systemctl is-active postgresql-15
+      register: v_svc
+      changed_when: false
+      failed_when: false
+
+    - name: Post-check - in recovery
+      become_user: postgres
+      shell: psql -tAc "select pg_is_in_recovery()"
+      args: { chdir: /tmp }
+      register: v_rec
+      retries: 5
+      delay: 3
+      until: v_rec.rc == 0
+      changed_when: false
+
+    - name: Post-check - WAL receiver status
+      become_user: postgres
+      shell: psql -tAc "select status from pg_stat_wal_receiver"
+      args: { chdir: /tmp }
+      register: v_wr
+      retries: 10
+      delay: 3
+      until: v_wr.stdout | trim == 'streaming'
+      changed_when: false
+      failed_when: false
+
+    - name: Assert STAGE 2
+      assert:
+        that:
+          - v_sig.stat.exists
+          - v_svc.stdout | trim == 'active'
+          - v_rec.stdout | trim == 't'
+          - v_wr.stdout | trim == 'streaming'
+        fail_msg: "STAGE 2 FAILED: standby.signal={{ v_sig.stat.exists }}, service={{ v_svc.stdout }}, in_recovery={{ v_rec.stdout }}, wal_receiver='{{ v_wr.stdout }}'. Log dekho: /var/lib/pgsql/15/data/log/"
+        success_msg: "✔ STAGE 2 COMPLETE: standby recovery mode mein hai aur WAL receiver streaming kar raha hai"
+
+##############################################################
+# STAGE 3: END-TO-END VALIDATION
+##############################################################
+- name: "STAGE 3A - Primary side validation + test write"
+  hosts: primary
+  become: yes
+  tasks:
+    - name: Streaming clients on primary
+      become_user: postgres
+      shell: psql -tAc "select count(*) from pg_stat_replication where state='streaming'"
+      args: { chdir: /tmp }
+      register: v_stream
+      retries: 10
+      delay: 3
+      until: v_stream.stdout | trim | int >= 1
+      changed_when: false
+      failed_when: false
+
+    - name: Slot is active
+      become_user: postgres
+      shell: psql -tAc "select active from pg_replication_slots where slot_name='{{ slot }}'"
+      args: { chdir: /tmp }
+      register: v_act
+      changed_when: false
+
+    - name: Replay lag in bytes
+      become_user: postgres
+      shell: psql -tAc "select coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)),-1)::bigint from pg_stat_replication"
+      args: { chdir: /tmp }
+      register: v_lag
+      changed_when: false
+
+    - name: Write test row on primary
+      become_user: postgres
+      shell: |
+        psql -c "create table if not exists public.repl_check(id bigint)" &&
+        psql -c "insert into public.repl_check values ({{ ansible_date_time.epoch }})"
+      args: { chdir: /tmp, executable: /bin/bash }
+
+    - name: Assert STAGE 3A
+      assert:
+        that:
+          - v_stream.stdout | trim | int >= 1
+          - v_act.stdout | trim == 't'
+          - v_lag.stdout | trim | int >= 0
+          - v_lag.stdout | trim | int < 1048576
+        fail_msg: "STAGE 3A FAILED: streaming_clients={{ v_stream.stdout }}, slot_active={{ v_act.stdout }}, lag_bytes={{ v_lag.stdout }}"
+        success_msg: "✔ STAGE 3A COMPLETE: streaming, slot active, lag={{ v_lag.stdout }} bytes, test row insert ho gayi"
+
+- name: "STAGE 3B - Standby reads test row"
+  hosts: standby
+  become: yes
+  tasks:
+    - name: Read replicated row on standby
+      become_user: postgres
+      shell: psql -tAc "select count(*) from public.repl_check where id={{ hostvars[groups['primary'][0]].ansible_date_time.epoch }}"
+      args: { chdir: /tmp }
+      register: v_row
+      retries: 10
+      delay: 3
+      until: v_row.stdout | trim == '1'
+      changed_when: false
+      failed_when: false
+
+    - name: Assert STAGE 3B
+      assert:
+        that:
+          - v_row.stdout | trim == '1'
+        fail_msg: "STAGE 3B FAILED: primary ki test row standby par nahi mili, replication data nahi pahuncha raha"
+        success_msg: "✔ STAGE 3B COMPLETE: primary ka data standby par replicate ho gaya"
+
+- name: "FINAL SUMMARY"
+  hosts: primary
+  become: yes
+  tasks:
+    - become_user: postgres
+      shell: psql -x -c "select application_name, client_addr, state, sync_state from pg_stat_replication"
+      args: { chdir: /tmp }
+      register: r
+      changed_when: false
+    - debug: var=r.stdout_lines
+    - debug:
+        msg: "✔✔ ALL STAGES PASSED: pg-primary -> pg-standby streaming replication working"
